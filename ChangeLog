@@ -1,3 +1,15 @@
+2026-08-02  Dirk Eddelbuettel  <edd@debian.org>
+
+	* DESCRIPTION (Version, Date): Roll micro version and date
+
+	* tools/configureWin.R: If windows-arm64, use Makevars.no_blp
+	* configure.win: Added, calls tools/configureWin.R
+	* src/Makevars.win.in: Renamed from Makevars.win
+
+2026-01-10  Dirk Eddelbuettel  <edd@debian.org>
+
+	* DESCRIPTION (Additional_repositories): Remove temporary addition
+
 2026-01-08  Dirk Eddelbuettel  <edd@debian.org>
 
 	* DESCRIPTION (Additional_repositories): TEMPORARILY adding RcppCore
