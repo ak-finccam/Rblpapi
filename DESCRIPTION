@@ -1,6 +1,6 @@
 Package: Rblpapi
 Title: R Interface to 'Bloomberg'
-Version: 0.3.16.9003
+Version: 0.3.16.9004
 Date: 2026-08-01
 Authors@R: c(person("Whit", "Armstrong", role = "aut"),
              person("Dirk", "Eddelbuettel", role = c("aut", "cre"), email = "edd@debian.org",
