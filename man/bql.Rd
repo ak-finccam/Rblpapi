@@ -5,7 +5,7 @@
 \title{Run 'Bloomberg Query Language' (BQL) Queries}
 \usage{
 bql(expression, parse = TRUE, simplify = TRUE, verbose = FALSE,
-  con = defaultConnection())
+  parser = getOption("bqlParser", .bqlParsers), con = defaultConnection())
 }
 \arguments{
 \item{expression}{A character string with the BQL query, e.g.
@@ -15,8 +15,7 @@ bql(expression, parse = TRUE, simplify = TRUE, verbose = FALSE,
 be parsed into \code{data.frame} objects (requires either the
 \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package),
 defaults to \sQuote{TRUE}. If \sQuote{FALSE} the raw JSON string
-is returned. The option \code{Rblpapi.bqlParser} selects the
-parser explicitly, e.g. \code{options(Rblpapi.bqlParser="jsonlite")}.}
+is returned.}
 
 \item{simplify}{A boolean indicating whether a query returning a
 single data item should be returned directly as a \code{data.frame}
@@ -24,6 +23,11 @@ instead of a list of length one, defaults to \sQuote{TRUE}.}
 
 \item{verbose}{A boolean indicating whether verbose operation is
 desired, defaults to \sQuote{FALSE}.}
+
+\item{parser}{A character vector naming the JSON parsers to use in
+order of preference, defaulting to the \code{bqlParser} option and,
+failing that, to \sQuote{RcppSimdJson} then \sQuote{jsonlite}. The
+first one which is installed is used.}
 
 \item{con}{A connection object as created by a \code{blpConnect}
 call, and retrieved via the internal function

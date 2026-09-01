@@ -30,11 +30,30 @@ if (length(.parsers) == 0L)
 }
 .parse <- function(file, ...) Rblpapi:::.bqlParse(.readFixture(file), ...)
 
+## the parser in use labels every assertion; .p is resolved at call time
+.with <- function(txt) paste0(txt, " [", .p, "]")
+
+## compare outcomes and not only successes: a fixture which must raise has to
+## raise the same way through every parser and every chunking
+.outcome <- function(x, p) tryCatch(suppressWarnings(Rblpapi:::.bqlParse(x, parser=p)),
+                                    error = function(e) conditionMessage(e))
+
+.allIdentical <- function(x) all(vapply(x[-1], identical, logical(1), x[[1]]))
+
+## one skeleton for the single-item documents built by hand below; 'values' is
+## a vector of JSON literals, one per row, so quote any string value yourself
+.oneItemDoc <- function(type, values, name="v") {
+    paste0('{"results":{"', name, '":{"name":"', name, '","idColumn":{"name":"ID",',
+           '"type":"STRING","values":[',
+           paste0('"', seq_along(values), '"', collapse=","), ']},',
+           '"valuesColumn":{"name":"VALUE","type":"', type, '","values":[',
+           paste(values, collapse=","), ']},"secondaryColumns":[]}},',
+           '"responseExceptions":[]}')
+}
+
 ## -- offline parsing tests (no Bloomberg connection required) --------------
 
 for (.p in .parsers) {
-
-    .with <- function(txt) paste0(txt, " [", .p, "]")
 
     ## single-item query: one data.frame with declared column types
     res <- .parse("response_px_last.json", parser=.p)
@@ -71,15 +90,6 @@ for (.p in .parsers) {
     ## and a column of duplicates could not detect a reordering
     expect_equal(res$pe_ratio$PERIOD_END_DATE, as.Date(c("2024-09-30", "2024-09-28")),
                  info = .with("secondary DATE column keeps the row order"))
-
-    ## responses above 4 MiB arrive as fragments of one document, cut mid-token,
-    ## and must give the same result as the document delivered in one message
-    doc <- .readFixture("response_px_last.json")
-    cut <- nchar(doc) %/% 3L
-    fragments <- substring(doc, c(1L, cut + 1L, 2L * cut + 1L), c(cut, 2L * cut, nchar(doc)))
-    expect_equal(Rblpapi:::.bqlParse(fragments, parser=.p),
-                 Rblpapi:::.bqlParse(doc, parser=.p),
-                 info = .with("fragmented response parses like the joined document"))
 
     ## BQL errors surface as R errors
     expect_error(.parse("response_syntax_error.json", parser=.p),
@@ -138,8 +148,7 @@ for (.p in .parsers) {
 for (.p in .parsers) {
     for (f in list.files("bql", pattern = "[.]json$")) {
         doc <- .readFixture(f)
-        ref <- tryCatch(suppressWarnings(Rblpapi:::.bqlParse(doc, parser = .p)),
-                        error = function(e) conditionMessage(e))
+        ref <- .outcome(doc, .p)
         ## the two largest sizes are derived from the document, as a fixed size
         ## above the smallest fixture would give one chunk and compare the
         ## document with itself
@@ -147,37 +156,39 @@ for (.p in .parsers) {
         for (n in unique(c(1L, 7L, 64L, nb %/% 7L, nb %/% 2L))) {
             frags <- .chunkBytes(doc, n)
             expect_true(length(frags) > 1L,
-                        info = paste0(f, " really is split at ", n, " bytes"))
-            got <- tryCatch(suppressWarnings(Rblpapi:::.bqlParse(frags, parser = .p)),
-                            error = function(e) conditionMessage(e))
-            expect_equal(got, ref,
-                         info = paste0(f, " in ", length(frags), " chunks of ", n,
-                                       " bytes [", .p, "]"))
+                        info = .with(paste0(f, " really is split at ", n, " bytes")))
+            ## the join must return the original bytes; asserted directly as
+            ## well as through the parser, so a failure says which one broke
+            expect_identical(Rblpapi:::.bqlJoin(frags), doc,
+                             info = .with(paste0(f, " rejoins byte for byte at ", n)))
+            expect_equal(.outcome(frags, .p), ref,
+                         info = .with(paste0(f, " in ", length(frags),
+                                             " chunks of ", n, " bytes")))
         }
     }
 
     ## a single fragment is not a document: the failure the joining prevents
     doc <- .readFixture("response_px_last.json")
     frags <- .chunkBytes(doc, nchar(doc, type = "bytes") %/% 2L)
-    expect_true(length(frags) > 1L, info = "the fixture really was split")
+    expect_true(length(frags) > 1L, info = .with("the fixture really was split"))
     expect_error(Rblpapi:::.bqlParse(frags[1], parser = .p),
-                 info = paste0("a lone fragment does not parse [", .p, "]"))
+                 info = .with("a lone fragment does not parse"))
 
     ## a boundary inside a multi-byte UTF-8 character must still rejoin; the
     ## characters are written as escapes so that this file stays ASCII
-    utf8doc <- paste0('{"results":{"name":{"name":"name","idColumn":{"name":"ID",',
-                      '"type":"STRING","values":["X","Y"]},"valuesColumn":',
-                      '{"name":"VALUE","type":"STRING","values":',
-                      '["Nestl\u00e9 S\u00e9n\u00e9gal","\u00dcbermorgen"]},',
-                      '"secondaryColumns":[]}},"responseExceptions":[]}')
+    utf8doc <- .oneItemDoc("STRING",
+                           c('"Nestl\u00e9 S\u00e9n\u00e9gal"', '"\u00dcbermorgen"'),
+                           name = "name")
     want <- c("Nestl\u00e9 S\u00e9n\u00e9gal", "\u00dcbermorgen")
     expect_equal(Rblpapi:::.bqlParse(utf8doc, parser = .p)$name, want,
-                 info = paste0("multi-byte characters read correctly [", .p, "]"))
+                 info = .with("multi-byte characters read correctly"))
     for (n in 1L:8L) {
         frags <- .chunkBytes(utf8doc, n)
+        expect_identical(Rblpapi:::.bqlJoin(frags), utf8doc,
+                         info = .with(paste0("multi-byte rejoin at ", n, " bytes")))
         expect_equal(Rblpapi:::.bqlParse(frags, parser = .p)$name, want,
-                     info = paste0("multi-byte characters survive ", n,
-                                   "-byte chunking [", .p, "]"))
+                     info = .with(paste0("multi-byte characters survive ", n,
+                                         "-byte chunking")))
     }
 }
 
@@ -185,11 +196,8 @@ for (.p in .parsers) {
 
 if (length(.parsers) > 1L) {
     for (f in list.files("bql", pattern="[.]json$")) {
-        out <- lapply(.parsers, function(p)
-            tryCatch(suppressWarnings(.parse(f, parser=p)),
-                     error=function(e) conditionMessage(e)))
-        expect_true(all(vapply(out[-1], identical, logical(1), out[[1]])),
-                    info = paste("all parsers agree on", f))
+        out <- lapply(.parsers, function(p) .outcome(.readFixture(f), p))
+        expect_true(.allIdentical(out), info = paste("all parsers agree on", f))
     }
 }
 
@@ -201,12 +209,15 @@ expect_true(Rblpapi:::.bqlParser() %in% .parsers, info = "default parser is inst
 if (all(c("RcppSimdJson", "jsonlite") %in% .parsers))
     expect_equal(Rblpapi:::.bqlParser(), "RcppSimdJson",
                  info = "RcppSimdJson is preferred when both are installed")
-local({
-    old <- options(Rblpapi.bqlParser=.parsers[length(.parsers)])
+## one helper, so a throwing assertion cannot leak the option to later tests
+.withOption <- function(value, expr) {
+    old <- options(bqlParser=value)
     on.exit(options(old))
-    expect_equal(Rblpapi:::.bqlParser(), .parsers[length(.parsers)],
-                 info = "option selects the parser")
-})
+    force(expr)
+}
+.withOption(.parsers[length(.parsers)],
+            expect_equal(Rblpapi:::.bqlParser(), .parsers[length(.parsers)],
+                         info = "option selects the parser"))
 
 ## an unknown parser name must be reported, not treated as "no data"
 expect_error(Rblpapi:::.bqlFromJSON("{}", "notAParser"),
@@ -215,16 +226,12 @@ expect_error(Rblpapi:::.bqlFromJSON("{}", "notAParser"),
 
 ## the option is validated: no abbreviations, and an unknown name is not
 ## silently dropped when a known one sits beside it
-local({
-    for (bad in list("notAParser", c("notAParser", "jsonlite"), "R", "j",
-                     NA_character_, "", 1L, TRUE, list("jsonlite"))) {
-        old <- options(Rblpapi.bqlParser = bad)
-        expect_error(Rblpapi:::.bqlParser(),
-                     info = paste("option rejected:",
-                                  paste(deparse(bad), collapse = "")))
-        options(old)
-    }
-})
+for (.bad in list("notAParser", c("notAParser", "jsonlite"), "R", "j",
+                  NA_character_, "", 1L, TRUE, list("jsonlite"), character(0)))
+    .withOption(.bad,
+                expect_error(Rblpapi:::.bqlParser(),
+                             info = paste("option rejected:",
+                                          paste(deparse(.bad), collapse = ""))))
 
 ## the parsers must agree on the intermediate structure, not merely on the
 ## final data.frame: '[]', '{}' and null are where they differ by default, so
@@ -232,7 +239,7 @@ local({
 if (length(.parsers) > 1L) {
     .shapes <- '{"a":[],"b":{},"c":[1,null,"x",true],"d":{"e":[{"f":null}]}}'
     .trees <- lapply(.parsers, function(p) Rblpapi:::.bqlFromJSON(.shapes, p))
-    expect_true(all(vapply(.trees[-1], identical, logical(1), .trees[[1]])),
+    expect_true(.allIdentical(.trees),
                 info = "parsers agree on the intermediate structure")
 }
 
@@ -297,35 +304,19 @@ expect_error(.col(name="X", type="STRING", values=list("a", list("b", "c"))),
 ## a placeholder string sits beside them: the placeholders are blanked before
 ## the column is flattened, so it never detours through character. The second
 ## case is the one that regresses if that step is dropped.
-.doubleDoc <- function(vals)
-    paste0('{"results":{"v":{"name":"v","idColumn":{"name":"ID","type":"STRING",',
-           '"values":[', paste0('"', seq_along(vals), '"', collapse=","), ']},',
-           '"valuesColumn":{"name":"VALUE","type":"DOUBLE","values":[',
-           paste(vals, collapse=","), ']},"secondaryColumns":[]}},',
-           '"responseExceptions":[]}')
-
-for (.p in .parsers) {
-    .exact <- 0.12345678901234568
-    res <- Rblpapi:::.bqlParse(.doubleDoc(c("0.12345678901234568", "null")), parser=.p)
-    expect_identical(res$v[1], .exact,
-                     info = paste0("DOUBLE keeps every digit without a placeholder [", .p, "]"))
-    expect_true(is.na(res$v[2]),
-                info = paste0("null in a DOUBLE column is NA [", .p, "]"))
-
-    for (.ph in c('"NaN"', '"NA"', '""')) {
-        res <- Rblpapi:::.bqlParse(.doubleDoc(c("0.12345678901234568", .ph)), parser=.p)
-        expect_identical(res$v[1], .exact,
-                         info = paste0("DOUBLE keeps every digit beside a ", .ph,
-                                       " placeholder [", .p, "]"))
-        expect_identical(res$v[2], NA_real_,
-                         info = paste0("the ", .ph, " placeholder itself is NA [", .p, "]"))
-    }
-
-    ## a real float32-derived price, the case which motivated all of this
-    res <- Rblpapi:::.bqlParse(.doubleDoc(c("230.66000366210938", '"NaN"')), parser=.p)
-    expect_identical(res$v[1], 230.66000366210938,
-                     info = paste0("a float-derived price is exact [", .p, "]"))
-}
+## as.numeric() is correctly rounded, so as.numeric(.v) is bit-identical to
+## the literal in the document and needs no separate expected value.
+## 230.66000366210938 is a real float32-derived price, the case which
+## motivated all of this.
+for (.p in .parsers)
+    for (.v in c("0.12345678901234568", "230.66000366210938"))
+        for (.ph in c("null", '"NaN"', '"NA"', '""')) {
+            res <- Rblpapi:::.bqlParse(.oneItemDoc("DOUBLE", c(.v, .ph)), parser=.p)
+            expect_identical(res$v[1], as.numeric(.v),
+                             info = .with(paste("DOUBLE keeps every digit beside", .ph)))
+            expect_identical(res$v[2], NA_real_,
+                             info = .with(paste("the", .ph, "placeholder itself is NA")))
+        }
 
 ## a number written as a string is not a placeholder and must still convert
 expect_equal(.col(type="DOUBLE", values=list("123.45", 6, "NaN")),

@@ -44,13 +44,16 @@
 ##' be parsed into \code{data.frame} objects (requires either the
 ##' \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package),
 ##' defaults to \sQuote{TRUE}. If \sQuote{FALSE} the raw JSON string
-##' is returned. The option \code{Rblpapi.bqlParser} selects the
-##' parser explicitly, e.g. \code{options(Rblpapi.bqlParser="jsonlite")}.
+##' is returned.
 ##' @param simplify A boolean indicating whether a query returning a
 ##' single data item should be returned directly as a \code{data.frame}
 ##' instead of a list of length one, defaults to \sQuote{TRUE}.
 ##' @param verbose A boolean indicating whether verbose operation is
 ##' desired, defaults to \sQuote{FALSE}.
+##' @param parser A character vector naming the JSON parsers to use in
+##' order of preference, defaulting to the \code{bqlParser} option and,
+##' failing that, to \sQuote{RcppSimdJson} then \sQuote{jsonlite}. The
+##' first one which is installed is used.
 ##' @param con A connection object as created by a \code{blpConnect}
 ##' call, and retrieved via the internal function
 ##' \code{defaultConnection}.
@@ -74,11 +77,12 @@ bql <- function(expression,
                 parse=TRUE,
                 simplify=TRUE,
                 verbose=FALSE,
+                parser=getOption("bqlParser", .bqlParsers),
                 con=defaultConnection()) {
 
     ## resolve the parser before the request so that a missing package does
     ## not discard a response which has already been retrieved
-    parser <- if (parse) .bqlParser() else NULL
+    if (parse) parser <- .bqlParser(parser)
     res <- bql_Impl(con, expression, verbose)
     if (!parse) return(.bqlJoin(res))
     .bqlParse(res, simplify=simplify, parser=parser)
@@ -91,17 +95,16 @@ bql <- function(expression,
 ## Supported JSON parsers, in order of preference
 .bqlParsers <- c("RcppSimdJson", "jsonlite")
 
-## Select the JSON parser: RcppSimdJson is preferred as it is faster on the
-## large documents BQL can return, jsonlite is the fallback. The option
-## 'Rblpapi.bqlParser' forces one, which also lets the tests exercise both.
-.bqlParser <- function() {
+## Select the first of 'want' which is installed. RcppSimdJson comes first by
+## default as it is faster on the large documents BQL can return, with jsonlite
+## as the fallback; naming one picks it, which also lets the tests exercise
+## both.
+.bqlParser <- function(want=getOption("bqlParser", .bqlParsers)) {
     ## validated here rather than with match.arg(), which would accept an
     ## abbreviation and would silently drop an unknown name given alongside a
-    ## known one
-    want <- getOption("Rblpapi.bqlParser", .bqlParsers)
-    if (!is.character(want) || length(want) == 0L || anyNA(want) ||
-        !all(want %in% .bqlParsers))
-        stop("Option 'Rblpapi.bqlParser' must be one or more of ",
+    ## known one. An NA needs no clause of its own: it matches no known name.
+    if (!is.character(want) || length(want) == 0L || !all(want %in% .bqlParsers))
+        stop("'parser' must be one or more of ",
              paste0("'", .bqlParsers, "'", collapse=", "), call.=FALSE)
     for (p in want) if (requireNamespace(p, quietly=TRUE)) return(p)
     ## name only what was actually asked for, which may be a single parser
@@ -194,10 +197,8 @@ bql <- function(expression,
 }
 
 ## Convert a BQL column (list with 'type' and 'values') to a typed R vector.
-## The values arrive as a list of scalars, one element per row. They are
-## flattened with vectorised primitives rather than one element at a time:
-## 'lengths()' finds the JSON nulls without a call per element, and unlist()
-## does the rest in one step.
+## The values arrive as a list of scalars, one element per row, and are
+## flattened with vectorised primitives rather than one element at a time.
 ##
 ## JSON null maps to NA for every type; the string placeholders "NaN" and
 ## "NA" additionally map to NA for numeric columns only, as string columns
@@ -217,31 +218,28 @@ bql <- function(expression,
 ## avoid.
 .bqlColumn <- function(col) {
     type <- if (is.null(col[["type"]])) "STRING" else col[["type"]]
-    values <- col[["values"]]
-    n <- length(values)
-    values[lengths(values) == 0L] <- NA
-    values <- unlist(values, use.names=FALSE)
+    vals <- col[["values"]]
+    n <- length(vals)
+    vals[lengths(vals) == 0L] <- NA
+    values <- unlist(vals, use.names=FALSE)
     ## unlist() flattens a nested value instead of failing, unlike the vapply()
     ## this replaces. This catches a value which flattens to more than one
     ## element; one which flattens to exactly one is kept, as it was before.
     if (length(values) != n)
         stop("BQL column '", .bqlColName(col, "?"),
              "' has non-scalar values", call.=FALSE)
-    ## Blank the "NaN", "NA" and "" placeholders which stand for a missing
-    ## number. Doing it in the list, before flattening, is what lets unlist()
-    ## keep the column numeric: a single such string would otherwise promote
-    ## the whole column to character and send every number back through its 15
-    ## significant digit form. Only a numeric column is treated this way, as a
-    ## string column may legitimately hold those spellings. Any other string is
-    ## a number written as a string, which as.numeric() below still converts.
-    ## This costs one pass per element, and only for a numeric column which
-    ## really does contain a placeholder.
-    if (is.character(values) && type %in% c("DOUBLE", "INT")) {
-        vals <- col[["values"]]
-        isph <- vapply(vals, is.character, NA)
-        isph[isph] <- unlist(vals[isph], use.names=FALSE) %in% c("NaN", "NA", "")
+    ## Blanking the placeholders in the list and flattening again is what keeps
+    ## a numeric column numeric, and so exact. Only a numeric column is treated
+    ## this way, as a string column may legitimately hold those spellings, and
+    ## any other string is a number written as a string which as.numeric()
+    ## still converts. 'values' is already the character form here, so finding
+    ## them takes one vectorised pass; a JSON number never prints as one, and a
+    ## blanked null is NA_character_ rather than "NA", so neither is mistaken
+    ## for a placeholder.
+    if (is.character(values) && (type == "DOUBLE" || type == "INT")) {
+        isph <- values %in% c("NaN", "NA", "")
         if (any(isph)) {
-            vals[isph | lengths(vals) == 0L] <- NA
+            vals[isph] <- NA
             values <- unlist(vals, use.names=FALSE)
         }
     }
@@ -249,21 +247,22 @@ bql <- function(expression,
            "DOUBLE"   = as.numeric(values),
            "INT"      = as.integer(values),
            "BOOLEAN"  = if (is.logical(values)) values
-                        else as.logical(toupper(.bqlChar(values))),
-           "DATE"     = .bqlByUnique(substr(.bqlChar(values), 1L, 10L), as.Date),
-           "DATETIME" = .bqlByUnique(.bqlChar(values), function(u)
-                            as.POSIXct(u, format="%Y-%m-%dT%H:%M:%OS", tz="UTC")),
-           .bqlChar(values))
+                        else as.logical(toupper(values)),
+           ## truncating inside .bqlByUnique truncates the distinct strings
+           ## rather than every row
+           "DATE"     = .bqlByUnique(as.character(values),
+                                     function(u) as.Date(substr(u, 1L, 10L))),
+           "DATETIME" = .bqlByUnique(as.character(values), as.POSIXct,
+                                     format="%Y-%m-%dT%H:%M:%OS", tz="UTC"),
+           ## a column of only nulls has flattened to a logical vector, so the
+           ## character types still need the conversion
+           as.character(values))
 }
-
-## A column of only nulls flattens to a logical vector, so the character types
-## still need the conversion; for an actual character vector this is a no-op
-.bqlChar <- function(v) if (is.character(v)) v else as.character(v)
 
 ## Parsing a date string costs far more per value than a hash lookup, and BQL
 ## date columns repeat heavily (one date per period, the same date for many
 ## securities), so convert only the distinct strings
-.bqlByUnique <- function(v, fun) {
+.bqlByUnique <- function(v, fun, ...) {
     u <- unique(v)
-    fun(u)[match(v, u)]
+    fun(u, ...)[match(v, u)]
 }
