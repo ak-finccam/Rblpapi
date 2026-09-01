@@ -111,6 +111,62 @@ for (.p in .parsers) {
                  info = .with("grouped: undeclared types like ENUM fall back to character"))
 }
 
+## -- fragmented responses -------------------------------------------------
+
+## The C++ layer returns one string per response message, and the service cuts
+## a response above 4 MiB at a byte boundary, in the middle of a token, so the
+## fragments form one document only once joined. Chunking a fixture into pieces
+## far smaller than 4 MiB reproduces that without needing a 4 MiB response.
+##
+## The chunking is on bytes, not on characters, because that is what the
+## service does: a boundary can fall inside a multi-byte UTF-8 character, which
+## leaves that one fragment invalid UTF-8 on its own.
+.chunkBytes <- function(txt, n) {
+    b <- charToRaw(txt)
+    i <- split(seq_along(b), ceiling(seq_along(b) / n))
+    vapply(i, function(k) rawToChar(b[k]), character(1), USE.NAMES = FALSE)
+}
+
+for (.p in .parsers) {
+    for (f in list.files("bql", pattern = "[.]json$")) {
+        doc <- .readFixture(f)
+        ref <- tryCatch(suppressWarnings(Rblpapi:::.bqlParse(doc, parser = .p)),
+                        error = function(e) conditionMessage(e))
+        for (n in c(1L, 7L, 64L, 1000L)) {
+            frags <- .chunkBytes(doc, n)
+            got <- tryCatch(suppressWarnings(Rblpapi:::.bqlParse(frags, parser = .p)),
+                            error = function(e) conditionMessage(e))
+            expect_equal(got, ref,
+                         info = paste0(f, " in ", length(frags), " chunks of ", n,
+                                       " bytes [", .p, "]"))
+        }
+    }
+
+    ## a single fragment is not a document: the failure the joining prevents
+    doc <- .readFixture("response_px_last.json")
+    frags <- .chunkBytes(doc, nchar(doc, type = "bytes") %/% 2L)
+    expect_true(length(frags) > 1L, info = "the fixture really was split")
+    expect_error(Rblpapi:::.bqlParse(frags[1], parser = .p),
+                 info = paste0("a lone fragment does not parse [", .p, "]"))
+
+    ## a boundary inside a multi-byte UTF-8 character must still rejoin; the
+    ## characters are written as escapes so that this file stays ASCII
+    utf8doc <- paste0('{"results":{"name":{"name":"name","idColumn":{"name":"ID",',
+                      '"type":"STRING","values":["X","Y"]},"valuesColumn":',
+                      '{"name":"VALUE","type":"STRING","values":',
+                      '["Nestl\u00e9 S\u00e9n\u00e9gal","\u00dcbermorgen"]},',
+                      '"secondaryColumns":[]}},"responseExceptions":[]}')
+    want <- c("Nestl\u00e9 S\u00e9n\u00e9gal", "\u00dcbermorgen")
+    expect_equal(Rblpapi:::.bqlParse(utf8doc, parser = .p)$name, want,
+                 info = paste0("multi-byte characters read correctly [", .p, "]"))
+    for (n in 1L:8L) {
+        frags <- .chunkBytes(utf8doc, n)
+        expect_equal(Rblpapi:::.bqlParse(frags, parser = .p)$name, want,
+                     info = paste0("multi-byte characters survive ", n,
+                                   "-byte chunking [", .p, "]"))
+    }
+}
+
 ## -- the parsers must agree exactly ----------------------------------------
 
 if (length(.parsers) > 1L) {
