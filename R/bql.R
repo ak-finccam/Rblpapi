@@ -130,7 +130,11 @@ bql <- function(expression,
 ## done from the declared BQL column types in .bqlColumn. The two 'empty'
 ## arguments make RcppSimdJson agree with jsonlite on '[]' and '{}', which it
 ## maps to NULL by default.
-.bqlFromJSON <- function(txt, parser=.bqlParser()) {
+##
+## 'parser' is required rather than defaulted, so that bql() stays the one
+## place which decides which parser to use and .bqlParse only passes that
+## decision down.
+.bqlFromJSON <- function(txt, parser) {
     switch(parser,
            "RcppSimdJson" =
                RcppSimdJson::fparse(txt,
