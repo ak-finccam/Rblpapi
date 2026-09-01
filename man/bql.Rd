@@ -12,9 +12,11 @@ bql(expression, parse = TRUE, simplify = TRUE, verbose = FALSE,
 \code{"get(px_last) for(['IBM US Equity'])"}.}
 
 \item{parse}{A boolean indicating whether the JSON response should
-be parsed into \code{data.frame} objects (requires the
-\CRANpkg{jsonlite} package), defaults to \sQuote{TRUE}. If
-\sQuote{FALSE} the raw JSON string is returned.}
+be parsed into \code{data.frame} objects (requires either the
+\CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package),
+defaults to \sQuote{TRUE}. If \sQuote{FALSE} the raw JSON string
+is returned. The option \code{Rblpapi.bqlParser} selects the
+parser explicitly, e.g. \code{options(Rblpapi.bqlParser="jsonlite")}.}
 
 \item{simplify}{A boolean indicating whether a query returning a
 single data item should be returned directly as a \code{data.frame}
@@ -48,10 +50,12 @@ The service returns a single JSON document. Each queried data
 item is self-describing: every column carries a declared type
 (\sQuote{STRING}, \sQuote{DOUBLE}, \sQuote{INT}, \sQuote{DATE},
 \sQuote{DATETIME}, \sQuote{BOOLEAN}) which is used to construct
-properly-typed \code{data.frame} columns. Parsing requires the
-\CRANpkg{jsonlite} package; set \code{parse=FALSE} to obtain the
-raw JSON string instead, e.g. for queries whose shape the
-parser does not handle.
+properly-typed \code{data.frame} columns. Parsing requires either
+the \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package;
+\CRANpkg{RcppSimdJson} is preferred when both are installed as it
+is faster on the large documents BQL can return. Both give the
+same result. Set \code{parse=FALSE} to obtain the raw JSON string
+instead, e.g. for queries whose shape the parser does not handle.
 
 Note that \sQuote{//blp/bqlsvc} is not part of the officially
 documented public API; it is the service behind the Excel BQL

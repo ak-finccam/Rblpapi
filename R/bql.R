@@ -25,10 +25,12 @@
 ##' item is self-describing: every column carries a declared type
 ##' (\sQuote{STRING}, \sQuote{DOUBLE}, \sQuote{INT}, \sQuote{DATE},
 ##' \sQuote{DATETIME}, \sQuote{BOOLEAN}) which is used to construct
-##' properly-typed \code{data.frame} columns. Parsing requires the
-##' \CRANpkg{jsonlite} package; set \code{parse=FALSE} to obtain the
-##' raw JSON string instead, e.g. for queries whose shape the
-##' parser does not handle.
+##' properly-typed \code{data.frame} columns. Parsing requires either
+##' the \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package;
+##' \CRANpkg{RcppSimdJson} is preferred when both are installed as it
+##' is faster on the large documents BQL can return. Both give the
+##' same result. Set \code{parse=FALSE} to obtain the raw JSON string
+##' instead, e.g. for queries whose shape the parser does not handle.
 ##'
 ##' Note that \sQuote{//blp/bqlsvc} is not part of the officially
 ##' documented public API; it is the service behind the Excel BQL
@@ -38,9 +40,11 @@
 ##' @param expression A character string with the BQL query, e.g.
 ##' \code{"get(px_last) for(['IBM US Equity'])"}.
 ##' @param parse A boolean indicating whether the JSON response should
-##' be parsed into \code{data.frame} objects (requires the
-##' \CRANpkg{jsonlite} package), defaults to \sQuote{TRUE}. If
-##' \sQuote{FALSE} the raw JSON string is returned.
+##' be parsed into \code{data.frame} objects (requires either the
+##' \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package),
+##' defaults to \sQuote{TRUE}. If \sQuote{FALSE} the raw JSON string
+##' is returned. The option \code{Rblpapi.bqlParser} selects the
+##' parser explicitly, e.g. \code{options(Rblpapi.bqlParser="jsonlite")}.
 ##' @param simplify A boolean indicating whether a query returning a
 ##' single data item should be returned directly as a \code{data.frame}
 ##' instead of a list of length one, defaults to \sQuote{TRUE}.
@@ -71,22 +75,54 @@ bql <- function(expression,
                 verbose=FALSE,
                 con=defaultConnection()) {
 
+    ## resolve the parser before the request so that a missing package does
+    ## not discard a response which has already been retrieved
+    parser <- if (parse) .bqlParser() else NULL
     res <- bql_Impl(con, expression, verbose)
     if (!parse) return(.bqlJoin(res))
-    if (!requireNamespace("jsonlite", quietly=TRUE))
-        stop("The 'jsonlite' package is required to parse BQL responses; ",
-             "install it or call bql(..., parse=FALSE) for the raw JSON.",
-             call.=FALSE)
-    .bqlParse(res, simplify=simplify)
+    .bqlParse(res, simplify=simplify, parser=parser)
 }
 
 ## The service delivers responses larger than 4 MiB in several messages, cutting
 ## the JSON mid-token: the fragments form one document only once joined
 .bqlJoin <- function(fragments) paste0(fragments, collapse="")
 
+## Supported JSON parsers, in order of preference
+.bqlParsers <- c("RcppSimdJson", "jsonlite")
+
+## Select the JSON parser: RcppSimdJson is preferred as it is faster on the
+## large documents BQL can return, jsonlite is the fallback. The option
+## 'Rblpapi.bqlParser' forces one, which also lets the tests exercise both.
+.bqlParser <- function() {
+    want <- match.arg(getOption("Rblpapi.bqlParser", .bqlParsers),
+                      .bqlParsers, several.ok=TRUE)
+    for (p in want) if (requireNamespace(p, quietly=TRUE)) return(p)
+    stop("Parsing BQL responses requires the '",
+         paste(.bqlParsers, collapse="' or '"), "' package; install one ",
+         "of them or call bql(..., parse=FALSE) for the raw JSON.",
+         call.=FALSE)
+}
+
+## Parse one JSON document into nested lists. Both parsers are asked not to
+## simplify at all so that they return the very same structure: the typing is
+## done from the declared BQL column types in .bqlColumn. The two 'empty'
+## arguments make RcppSimdJson agree with jsonlite on '[]' and '{}', which it
+## maps to NULL by default.
+.bqlFromJSON <- function(txt, parser=.bqlParser()) {
+    switch(parser,
+           "RcppSimdJson" =
+               RcppSimdJson::fparse(txt,
+                                    max_simplify_lvl="list",
+                                    empty_array=list(),
+                                    empty_object=structure(list(),
+                                                           names=character())),
+           "jsonlite" =
+               jsonlite::fromJSON(txt, simplifyVector=FALSE))
+}
+
 ## Parse a raw BQL JSON response into a named list of data.frames
-.bqlParse <- function(json, simplify=TRUE) {
-    parsed <- jsonlite::fromJSON(.bqlJoin(json), simplifyVector=FALSE)
+.bqlParse <- function(json, simplify=TRUE, parser=.bqlParser()) {
+    parsed <- .bqlFromJSON(.bqlJoin(json), parser)
     .bqlCheckExceptions(parsed)
     tables <- list()
     for (item in parsed[["results"]]) {
@@ -147,21 +183,54 @@ bql <- function(expression,
 }
 
 ## Convert a BQL column (list with 'type' and 'values') to a typed R vector.
+## The values arrive as a list of scalars, one element per row. They are
+## flattened with vectorised primitives rather than one element at a time:
+## 'lengths()' finds the JSON nulls without a call per element, and unlist()
+## does the rest in one step. A column of plain JSON numbers therefore stays
+## numeric all the way and is never turned into character, which is both
+## faster and lossless.
+##
 ## JSON null maps to NA for every type; the string placeholders "NaN" and
 ## "NA" additionally map to NA for numeric columns only, as string columns
 ## may legitimately contain them (e.g. the ticker of 'NA US Equity').
 .bqlColumn <- function(col) {
-    values <- col[["values"]]
     type <- if (is.null(col[["type"]])) "STRING" else col[["type"]]
-    values <- vapply(values, function(v) {
-        if (is.null(v)) NA_character_ else as.character(v)
-    }, character(1))
-    numericNA <- function(v) { v[v %in% c("NaN", "NA", "")] <- NA_character_; v }
+    values <- col[["values"]]
+    if (!length(values)) values <- list()
+    n <- length(values)
+    values[lengths(values) == 0L] <- NA
+    values <- unlist(values, use.names=FALSE)
+    ## unlist() flattens a nested value instead of failing, unlike the
+    ## vapply() this replaces, so guard the one row per value invariant
+    if (length(values) != n)
+        stop("BQL column '", .bqlColName(col, "?"),
+             "' has non-scalar values", call.=FALSE)
     switch(type,
-           "DOUBLE"   = as.numeric(numericNA(values)),
-           "INT"      = as.integer(numericNA(values)),
-           "BOOLEAN"  = as.logical(toupper(values)),
-           "DATE"     = as.Date(substr(values, 1L, 10L)),
-           "DATETIME" = as.POSIXct(values, format="%Y-%m-%dT%H:%M:%OS", tz="UTC"),
-           values)
+           "DOUBLE"   = as.numeric(.bqlNumericNA(values)),
+           "INT"      = as.integer(.bqlNumericNA(values)),
+           "BOOLEAN"  = if (is.logical(values)) values
+                        else as.logical(toupper(.bqlChar(values))),
+           "DATE"     = .bqlByUnique(substr(.bqlChar(values), 1L, 10L), as.Date),
+           "DATETIME" = .bqlByUnique(.bqlChar(values), function(u)
+                            as.POSIXct(u, format="%Y-%m-%dT%H:%M:%OS", tz="UTC")),
+           .bqlChar(values))
+}
+
+## A column of only nulls flattens to a logical vector, so the character types
+## still need the conversion; for an actual character vector this is a no-op
+.bqlChar <- function(v) if (is.character(v)) v else as.character(v)
+
+## Only a character column can hold the "NaN" and "NA" placeholders, and
+## testing a numeric vector against them would convert it to character again
+.bqlNumericNA <- function(v) {
+    if (is.character(v)) v[v %in% c("NaN", "NA", "")] <- NA_character_
+    v
+}
+
+## Parsing a date string costs far more per value than a hash lookup, and BQL
+## date columns repeat heavily (one date per period, the same date for many
+## securities), so convert only the distinct strings
+.bqlByUnique <- function(v, fun) {
+    u <- unique(v)
+    fun(u)[match(v, u)]
 }
