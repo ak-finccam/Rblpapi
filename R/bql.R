@@ -28,9 +28,10 @@
 ##' properly-typed \code{data.frame} columns. Parsing requires either
 ##' the \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package;
 ##' \CRANpkg{RcppSimdJson} is preferred when both are installed as it
-##' is faster on the large documents BQL can return. Both give the
-##' same result. Set \code{parse=FALSE} to obtain the raw JSON string
-##' instead, e.g. for queries whose shape the parser does not handle.
+##' is faster on the large documents BQL can return. Both give the same
+##' result for the documents the service returns. Set
+##' \code{parse=FALSE} to obtain the raw JSON string instead, e.g. for
+##' queries whose shape the parser does not handle.
 ##'
 ##' Note that \sQuote{//blp/bqlsvc} is not part of the officially
 ##' documented public API; it is the service behind the Excel BQL
@@ -94,12 +95,19 @@ bql <- function(expression,
 ## large documents BQL can return, jsonlite is the fallback. The option
 ## 'Rblpapi.bqlParser' forces one, which also lets the tests exercise both.
 .bqlParser <- function() {
-    want <- match.arg(getOption("Rblpapi.bqlParser", .bqlParsers),
-                      .bqlParsers, several.ok=TRUE)
+    ## validated here rather than with match.arg(), which would accept an
+    ## abbreviation and would silently drop an unknown name given alongside a
+    ## known one
+    want <- getOption("Rblpapi.bqlParser", .bqlParsers)
+    if (!is.character(want) || length(want) == 0L || anyNA(want) ||
+        !all(want %in% .bqlParsers))
+        stop("Option 'Rblpapi.bqlParser' must be one or more of ",
+             paste0("'", .bqlParsers, "'", collapse=", "), call.=FALSE)
     for (p in want) if (requireNamespace(p, quietly=TRUE)) return(p)
-    stop("Parsing BQL responses requires the '",
-         paste(.bqlParsers, collapse="' or '"), "' package; install one ",
-         "of them or call bql(..., parse=FALSE) for the raw JSON.",
+    ## name only what was actually asked for, which may be a single parser
+    stop("Parsing BQL responses requires ",
+         paste0("'", want, "'", collapse=" or "),
+         "; install it or call bql(..., parse=FALSE) for the raw JSON.",
          call.=FALSE)
 }
 
@@ -117,7 +125,10 @@ bql <- function(expression,
                                     empty_object=structure(list(),
                                                            names=character())),
            "jsonlite" =
-               jsonlite::fromJSON(txt, simplifyVector=FALSE))
+               jsonlite::fromJSON(txt, simplifyVector=FALSE),
+           ## without this a wrong name would return NULL, and the caller
+           ## would see an empty result rather than a diagnosis
+           stop("Unknown BQL JSON parser '", parser, "'", call.=FALSE))
 }
 
 ## Parse a raw BQL JSON response into a named list of data.frames
@@ -186,28 +197,57 @@ bql <- function(expression,
 ## The values arrive as a list of scalars, one element per row. They are
 ## flattened with vectorised primitives rather than one element at a time:
 ## 'lengths()' finds the JSON nulls without a call per element, and unlist()
-## does the rest in one step. A column of plain JSON numbers therefore stays
-## numeric all the way and is never turned into character, which is both
-## faster and lossless.
+## does the rest in one step.
 ##
 ## JSON null maps to NA for every type; the string placeholders "NaN" and
 ## "NA" additionally map to NA for numeric columns only, as string columns
 ## may legitimately contain them (e.g. the ticker of 'NA US Equity').
+##
+## A numeric column stays numeric throughout and so keeps the values exactly
+## as the service sent them, rather than losing the last digits to a detour
+## through character. Bloomberg sends float-derived prices such as
+## 230.66000366210938, which as.character() would truncate to
+## 230.66000366210901.
+##
+## One consequence of letting unlist() pick the type does remain: it coerces a
+## logical before a string, so a JSON boolean sharing an array with a JSON
+## number becomes 1 or 0 rather than "TRUE" or "FALSE". BQL declares one type
+## per column and does not mix the two, and avoiding this would need a call
+## per element for every column, which is the cost this function exists to
+## avoid.
 .bqlColumn <- function(col) {
     type <- if (is.null(col[["type"]])) "STRING" else col[["type"]]
     values <- col[["values"]]
-    if (!length(values)) values <- list()
     n <- length(values)
     values[lengths(values) == 0L] <- NA
     values <- unlist(values, use.names=FALSE)
-    ## unlist() flattens a nested value instead of failing, unlike the
-    ## vapply() this replaces, so guard the one row per value invariant
+    ## unlist() flattens a nested value instead of failing, unlike the vapply()
+    ## this replaces. This catches a value which flattens to more than one
+    ## element; one which flattens to exactly one is kept, as it was before.
     if (length(values) != n)
         stop("BQL column '", .bqlColName(col, "?"),
              "' has non-scalar values", call.=FALSE)
+    ## Blank the "NaN", "NA" and "" placeholders which stand for a missing
+    ## number. Doing it in the list, before flattening, is what lets unlist()
+    ## keep the column numeric: a single such string would otherwise promote
+    ## the whole column to character and send every number back through its 15
+    ## significant digit form. Only a numeric column is treated this way, as a
+    ## string column may legitimately hold those spellings. Any other string is
+    ## a number written as a string, which as.numeric() below still converts.
+    ## This costs one pass per element, and only for a numeric column which
+    ## really does contain a placeholder.
+    if (is.character(values) && type %in% c("DOUBLE", "INT")) {
+        vals <- col[["values"]]
+        isph <- vapply(vals, is.character, NA)
+        isph[isph] <- unlist(vals[isph], use.names=FALSE) %in% c("NaN", "NA", "")
+        if (any(isph)) {
+            vals[isph | lengths(vals) == 0L] <- NA
+            values <- unlist(vals, use.names=FALSE)
+        }
+    }
     switch(type,
-           "DOUBLE"   = as.numeric(.bqlNumericNA(values)),
-           "INT"      = as.integer(.bqlNumericNA(values)),
+           "DOUBLE"   = as.numeric(values),
+           "INT"      = as.integer(values),
            "BOOLEAN"  = if (is.logical(values)) values
                         else as.logical(toupper(.bqlChar(values))),
            "DATE"     = .bqlByUnique(substr(.bqlChar(values), 1L, 10L), as.Date),
@@ -219,13 +259,6 @@ bql <- function(expression,
 ## A column of only nulls flattens to a logical vector, so the character types
 ## still need the conversion; for an actual character vector this is a no-op
 .bqlChar <- function(v) if (is.character(v)) v else as.character(v)
-
-## Only a character column can hold the "NaN" and "NA" placeholders, and
-## testing a numeric vector against them would convert it to character again
-.bqlNumericNA <- function(v) {
-    if (is.character(v)) v[v %in% c("NaN", "NA", "")] <- NA_character_
-    v
-}
 
 ## Parsing a date string costs far more per value than a hash lookup, and BQL
 ## date columns repeat heavily (one date per period, the same date for many

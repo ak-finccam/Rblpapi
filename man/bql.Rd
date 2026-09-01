@@ -53,9 +53,10 @@ item is self-describing: every column carries a declared type
 properly-typed \code{data.frame} columns. Parsing requires either
 the \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package;
 \CRANpkg{RcppSimdJson} is preferred when both are installed as it
-is faster on the large documents BQL can return. Both give the
-same result. Set \code{parse=FALSE} to obtain the raw JSON string
-instead, e.g. for queries whose shape the parser does not handle.
+is faster on the large documents BQL can return. Both give the same
+result for the documents the service returns. Set
+\code{parse=FALSE} to obtain the raw JSON string instead, e.g. for
+queries whose shape the parser does not handle.
 
 Note that \sQuote{//blp/bqlsvc} is not part of the officially
 documented public API; it is the service behind the Excel BQL

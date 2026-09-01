@@ -44,7 +44,10 @@ for (.p in .parsers) {
     expect_equal(unname(sapply(res, class)), c("character", "numeric", "Date", "character"),
                  info = .with("column types follow declared JSON types"))
     expect_equal(res$px_last[1:2], c(229.33, 254.49), info = .with("numeric values"))
-    expect_true(is.na(res$px_last[3]), info = .with("string 'NaN' becomes NA"))
+    ## expect_identical, not expect_equal: all.equal() treats NaN as equal to
+    ## NA_real_, so expect_equal would pass even if the placeholder handling
+    ## were removed altogether and as.numeric("NaN") left a NaN behind
+    expect_identical(res$px_last[3], NA_real_, info = .with("string 'NaN' becomes NA, not NaN"))
     expect_true(is.na(res$DATE[3]) && is.na(res$CURRENCY[3]), info = .with("JSON null becomes NA"))
     expect_equal(res$DATE[1], as.Date("2024-12-17"), info = .with("DATE conversion"))
 
@@ -63,6 +66,11 @@ for (.p in .parsers) {
                  info = .with("secondary columns appended"))
     expect_equal(class(res$pe_ratio$REVISION_COUNT), "integer", info = .with("INT maps to integer"))
     expect_equal(res$name$name[2], "Apple Inc", info = .with("string values"))
+    ## a DATE column is converted through unique()/match(), so assert the
+    ## values and not only the name: these two are deliberately descending,
+    ## and a column of duplicates could not detect a reordering
+    expect_equal(res$pe_ratio$PERIOD_END_DATE, as.Date(c("2024-09-30", "2024-09-28")),
+                 info = .with("secondary DATE column keeps the row order"))
 
     ## responses above 4 MiB arrive as fragments of one document, cut mid-token,
     ## and must give the same result as the document delivered in one message
@@ -132,8 +140,14 @@ for (.p in .parsers) {
         doc <- .readFixture(f)
         ref <- tryCatch(suppressWarnings(Rblpapi:::.bqlParse(doc, parser = .p)),
                         error = function(e) conditionMessage(e))
-        for (n in c(1L, 7L, 64L, 1000L)) {
+        ## the two largest sizes are derived from the document, as a fixed size
+        ## above the smallest fixture would give one chunk and compare the
+        ## document with itself
+        nb <- nchar(doc, type = "bytes")
+        for (n in unique(c(1L, 7L, 64L, nb %/% 7L, nb %/% 2L))) {
             frags <- .chunkBytes(doc, n)
+            expect_true(length(frags) > 1L,
+                        info = paste0(f, " really is split at ", n, " bytes"))
             got <- tryCatch(suppressWarnings(Rblpapi:::.bqlParse(frags, parser = .p)),
                             error = function(e) conditionMessage(e))
             expect_equal(got, ref,
@@ -182,17 +196,45 @@ if (length(.parsers) > 1L) {
 ## -- parser selection ------------------------------------------------------
 
 expect_true(Rblpapi:::.bqlParser() %in% .parsers, info = "default parser is installed")
+## the expected name is written out rather than taken from .bqlParsers, which
+## would make the assertion agree with any order that variable happened to have
+if (all(c("RcppSimdJson", "jsonlite") %in% .parsers))
+    expect_equal(Rblpapi:::.bqlParser(), "RcppSimdJson",
+                 info = "RcppSimdJson is preferred when both are installed")
 local({
     old <- options(Rblpapi.bqlParser=.parsers[length(.parsers)])
     on.exit(options(old))
     expect_equal(Rblpapi:::.bqlParser(), .parsers[length(.parsers)],
                  info = "option selects the parser")
 })
+
+## an unknown parser name must be reported, not treated as "no data"
+expect_error(Rblpapi:::.bqlFromJSON("{}", "notAParser"),
+             pattern = "Unknown BQL JSON parser",
+             info = "an unknown parser name is an error")
+
+## the option is validated: no abbreviations, and an unknown name is not
+## silently dropped when a known one sits beside it
 local({
-    old <- options(Rblpapi.bqlParser="notAParser")
-    on.exit(options(old))
-    expect_error(Rblpapi:::.bqlParser(), info = "unknown parser name is rejected")
+    for (bad in list("notAParser", c("notAParser", "jsonlite"), "R", "j",
+                     NA_character_, "", 1L, TRUE, list("jsonlite"))) {
+        old <- options(Rblpapi.bqlParser = bad)
+        expect_error(Rblpapi:::.bqlParser(),
+                     info = paste("option rejected:",
+                                  paste(deparse(bad), collapse = "")))
+        options(old)
+    }
 })
+
+## the parsers must agree on the intermediate structure, not merely on the
+## final data.frame: '[]', '{}' and null are where they differ by default, so
+## this is what the two 'empty' arguments and max_simplify_lvl="list" buy
+if (length(.parsers) > 1L) {
+    .shapes <- '{"a":[],"b":{},"c":[1,null,"x",true],"d":{"e":[{"f":null}]}}'
+    .trees <- lapply(.parsers, function(p) Rblpapi:::.bqlFromJSON(.shapes, p))
+    expect_true(all(vapply(.trees[-1], identical, logical(1), .trees[[1]])),
+                info = "parsers agree on the intermediate structure")
+}
 
 ## -- column conversion -----------------------------------------------------
 
@@ -209,6 +251,20 @@ expect_equal(.col(type="DOUBLE", values=list(NULL)), NA_real_,
 ## an empty or absent 'values' key gives a zero-length column, not an error
 expect_equal(.col(type="DOUBLE", values=list()), numeric(0), info = "empty column")
 expect_equal(.col(type="STRING"), character(0), info = "absent values key")
+expect_equal(.col(type="DATE"), as.Date(character(0)), info = "absent values key, DATE")
+
+## Every placeholder means NA in a numeric column, and only there. These use
+## expect_identical because all.equal() treats NaN as equal to NA_real_, so
+## expect_equal could not tell a real NA from the NaN that as.numeric("NaN")
+## leaves behind when the placeholder handling is missing.
+expect_identical(.col(type="DOUBLE", values=list(1, "NaN", "NA", "", 2)),
+                 c(1, NA, NA, NA, 2), info = "DOUBLE placeholders become NA")
+expect_identical(.col(type="INT", values=list(1L, "NaN", "NA", "")),
+                 c(1L, NA, NA, NA), info = "INT placeholders become NA")
+expect_false(any(is.nan(.col(type="DOUBLE", values=list(1, "NaN")))),
+             info = "'NaN' becomes NA rather than NaN")
+expect_equal(.col(type="STRING", values=list("NaN", "NA", "")),
+             c("NaN", "NA", ""), info = "STRING keeps the same spellings verbatim")
 
 ## JSON booleans and their string spellings both convert
 expect_equal(.col(type="BOOLEAN", values=list(TRUE, FALSE, NULL)), c(TRUE, FALSE, NA),
@@ -216,14 +272,64 @@ expect_equal(.col(type="BOOLEAN", values=list(TRUE, FALSE, NULL)), c(TRUE, FALSE
 expect_equal(.col(type="BOOLEAN", values=list("true", "FALSE", NULL)), c(TRUE, FALSE, NA),
              info = "boolean strings")
 
-## numeric columns keep full double precision: the values do not go through
-## character, which would keep only 15 significant digits
-expect_identical(.col(type="DOUBLE", values=list(pi, 1/3)), c(pi, 1/3),
-                 info = "DOUBLE column is lossless")
+## DATE and DATETIME are converted through unique()/match(), so a column whose
+## distinct values are neither sorted nor unique must keep its own row order
+.dts <- c("2024-03-05", "2024-01-31", "2024-03-05", "2024-02-29", "2024-01-31")
+expect_equal(.col(type="DATE", values=as.list(paste0(.dts, "T00:00:00Z"))),
+             as.Date(.dts), info = "DATE column keeps the row order")
+expect_equal(.col(type="DATE",
+                  values=c(as.list(paste0(.dts[1:2], "T00:00:00Z")), list(NULL),
+                           as.list(paste0(.dts[3:5], "T00:00:00Z")))),
+             as.Date(c(.dts[1:2], NA, .dts[3:5])),
+             info = "DATE column with an interleaved null keeps the row order")
+.tms <- c("2024-03-05T13:45:30Z", "2024-01-31T09:00:00Z", "2024-03-05T13:45:30Z")
+expect_equal(.col(type="DATETIME", values=as.list(.tms)),
+             as.POSIXct(.tms, format="%Y-%m-%dT%H:%M:%OS", tz="UTC"),
+             info = "DATETIME column keeps the row order")
 
 ## a nested value would silently shift the rows of a column, so it must fail
 expect_error(.col(name="X", type="STRING", values=list("a", list("b", "c"))),
              pattern = "non-scalar", info = "non-scalar values are rejected")
+
+## -- double precision through the JSON layer -------------------------------
+
+## A DOUBLE column keeps the exact values the document carried, whether or not
+## a placeholder string sits beside them: the placeholders are blanked before
+## the column is flattened, so it never detours through character. The second
+## case is the one that regresses if that step is dropped.
+.doubleDoc <- function(vals)
+    paste0('{"results":{"v":{"name":"v","idColumn":{"name":"ID","type":"STRING",',
+           '"values":[', paste0('"', seq_along(vals), '"', collapse=","), ']},',
+           '"valuesColumn":{"name":"VALUE","type":"DOUBLE","values":[',
+           paste(vals, collapse=","), ']},"secondaryColumns":[]}},',
+           '"responseExceptions":[]}')
+
+for (.p in .parsers) {
+    .exact <- 0.12345678901234568
+    res <- Rblpapi:::.bqlParse(.doubleDoc(c("0.12345678901234568", "null")), parser=.p)
+    expect_identical(res$v[1], .exact,
+                     info = paste0("DOUBLE keeps every digit without a placeholder [", .p, "]"))
+    expect_true(is.na(res$v[2]),
+                info = paste0("null in a DOUBLE column is NA [", .p, "]"))
+
+    for (.ph in c('"NaN"', '"NA"', '""')) {
+        res <- Rblpapi:::.bqlParse(.doubleDoc(c("0.12345678901234568", .ph)), parser=.p)
+        expect_identical(res$v[1], .exact,
+                         info = paste0("DOUBLE keeps every digit beside a ", .ph,
+                                       " placeholder [", .p, "]"))
+        expect_identical(res$v[2], NA_real_,
+                         info = paste0("the ", .ph, " placeholder itself is NA [", .p, "]"))
+    }
+
+    ## a real float32-derived price, the case which motivated all of this
+    res <- Rblpapi:::.bqlParse(.doubleDoc(c("230.66000366210938", '"NaN"')), parser=.p)
+    expect_identical(res$v[1], 230.66000366210938,
+                     info = paste0("a float-derived price is exact [", .p, "]"))
+}
+
+## a number written as a string is not a placeholder and must still convert
+expect_equal(.col(type="DOUBLE", values=list("123.45", 6, "NaN")),
+             c(123.45, 6, NA), info = "a number sent as a string still converts")
 
 ## -- live test (requires a Bloomberg connection) ----------------------------
 
