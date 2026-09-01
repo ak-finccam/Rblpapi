@@ -107,6 +107,15 @@ Rcpp::CharacterVector bql_Impl(SEXP con,
             if (verbose) Rcpp::Rcout << "Processing Response" << std::endl;
             processBqlEvent(event, res, verbose);
             done = true;
+        } else if (event.eventType() == Event::REQUEST_STATUS) {
+            // a rejected or timed-out request sends this and never a RESPONSE,
+            // so without it nextEvent() would block for good (cf. bdh.cpp)
+            MessageIterator msgIter(event);
+            while (msgIter.next()) {
+                Message msg = msgIter.message();
+                if (verbose) msg.asElement().print(Rcpp::Rcout);
+            }
+            Rcpp::stop("Bloomberg request timed out on server side");
         } else {
             MessageIterator msgIter(event);
             while (msgIter.next()) {

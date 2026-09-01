@@ -318,9 +318,47 @@ for (.p in .parsers)
                              info = .with(paste("the", .ph, "placeholder itself is NA")))
         }
 
-## a number written as a string is not a placeholder and must still convert
-expect_equal(.col(type="DOUBLE", values=list("123.45", 6, "NaN")),
-             c(123.45, 6, NA), info = "a number sent as a string still converts")
+## A number written as a string is not a placeholder and must still convert.
+## It is also the one case which does not keep every digit, because the column
+## has to come back from character; expect_identical pins that, since
+## expect_equal's tolerance would hide it either way.
+expect_identical(.col(type="DOUBLE", values=list("123.45", 6, "NaN")),
+                 c(123.45, 6, NA), info = "a number sent as a string still converts")
+expect_identical(.col(type="DOUBLE", values=list(230.66000366210938, "123.45")),
+                 c(as.numeric(as.character(230.66000366210938)), 123.45),
+                 info = "a number sent as a string costs the column its last digits")
+expect_identical(.col(type="DOUBLE", values=list(230.66000366210938, "NaN")),
+                 c(230.66000366210938, NA),
+                 info = "a placeholder does not")
+
+## -- assembling an item into a data.frame -----------------------------------
+
+.item <- function(...) Rblpapi:::.bqlItemToDataFrame(list(...))
+.scol <- function(nm, vals) list(name=nm, type="STRING", values=as.list(vals))
+
+## an item with no columns at all is an empty data.frame, not an error from
+## make.unique() being handed the NULL names of an empty list
+expect_equal(dim(.item(name="x", idColumn=NULL, valuesColumn=NULL,
+                       secondaryColumns=list())), c(0L, 0L),
+             info = "an item with no columns gives an empty data.frame")
+
+## a repeated column name must add a column, not replace the earlier one
+res <- .item(name="x", idColumn=.scol("ID", c("a", "b")),
+             valuesColumn=.scol("VALUE", c("1", "2")),
+             secondaryColumns=list(.scol("DATE", c("d1", "d2")),
+                                   .scol("DATE", c("e1", "e2"))))
+expect_equal(ncol(res), 4L, info = "a repeated column name keeps both columns")
+expect_equal(colnames(res), c("ID", "x", "DATE", "DATE.1"),
+             info = "make.unique() renames the second one")
+expect_equal(res$DATE, c("d1", "d2"), info = "the first DATE column is intact")
+expect_equal(res[["DATE.1"]], c("e1", "e2"), info = "the second DATE column is intact")
+
+## columns of unequal length cannot make a valid data.frame, so say so
+expect_error(.item(name="x", idColumn=.scol("ID", c("a", "b", "c")),
+                   valuesColumn=.scol("VALUE", c("1", "2")),
+                   secondaryColumns=list()),
+             pattern = "unequal length",
+             info = "unequal column lengths are rejected")
 
 ## -- live test (requires a Bloomberg connection) ----------------------------
 

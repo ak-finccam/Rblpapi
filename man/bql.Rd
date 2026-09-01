@@ -5,7 +5,7 @@
 \title{Run 'Bloomberg Query Language' (BQL) Queries}
 \usage{
 bql(expression, parse = TRUE, simplify = TRUE, verbose = FALSE,
-  parser = getOption("bqlParser", .bqlParsers), con = defaultConnection())
+  parser = NULL, con = defaultConnection())
 }
 \arguments{
 \item{expression}{A character string with the BQL query, e.g.
@@ -25,9 +25,9 @@ instead of a list of length one, defaults to \sQuote{TRUE}.}
 desired, defaults to \sQuote{FALSE}.}
 
 \item{parser}{A character vector naming the JSON parsers to use in
-order of preference, defaulting to the \code{bqlParser} option and,
-failing that, to \sQuote{RcppSimdJson} then \sQuote{jsonlite}. The
-first one which is installed is used.}
+order of preference; the first one which is installed is used.
+\sQuote{NULL}, the default, takes the \code{bqlParser} option and,
+failing that, tries \sQuote{RcppSimdJson} then \sQuote{jsonlite}.}
 
 \item{con}{A connection object as created by a \code{blpConnect}
 call, and retrieved via the internal function

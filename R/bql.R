@@ -51,9 +51,9 @@
 ##' @param verbose A boolean indicating whether verbose operation is
 ##' desired, defaults to \sQuote{FALSE}.
 ##' @param parser A character vector naming the JSON parsers to use in
-##' order of preference, defaulting to the \code{bqlParser} option and,
-##' failing that, to \sQuote{RcppSimdJson} then \sQuote{jsonlite}. The
-##' first one which is installed is used.
+##' order of preference; the first one which is installed is used.
+##' \sQuote{NULL}, the default, takes the \code{bqlParser} option and,
+##' failing that, tries \sQuote{RcppSimdJson} then \sQuote{jsonlite}.
 ##' @param con A connection object as created by a \code{blpConnect}
 ##' call, and retrieved via the internal function
 ##' \code{defaultConnection}.
@@ -77,13 +77,20 @@ bql <- function(expression,
                 parse=TRUE,
                 simplify=TRUE,
                 verbose=FALSE,
-                parser=getOption("bqlParser", .bqlParsers),
+                parser=NULL,
                 con=defaultConnection()) {
 
     ## resolve the parser before the request so that a missing package does
     ## not discard a response which has already been retrieved
     if (parse) parser <- .bqlParser(parser)
     res <- bql_Impl(con, expression, verbose)
+    ## the C++ layer returns nothing at all when the session ended before the
+    ## response arrived; say so rather than let the JSON parser report the
+    ## empty string as a truncated document
+    if (!length(res))
+        stop("The BQL request returned no messages, which happens when the ",
+             "session ends before the response arrives. Check the connection.",
+             call.=FALSE)
     if (!parse) return(.bqlJoin(res))
     .bqlParse(res, simplify=simplify, parser=parser)
 }
@@ -99,7 +106,11 @@ bql <- function(expression,
 ## default as it is faster on the large documents BQL can return, with jsonlite
 ## as the fallback; naming one picks it, which also lets the tests exercise
 ## both.
-.bqlParser <- function(want=getOption("bqlParser", .bqlParsers)) {
+.bqlParser <- function(want=NULL) {
+    ## NULL, the default of bql()'s 'parser', means "whatever the option says,
+    ## else the built-in order". Resolved here so that bql()'s signature, and
+    ## therefore its help page, does not name an unexported object.
+    if (is.null(want)) want <- getOption("bqlParser", .bqlParsers)
     ## validated here rather than with match.arg(), which would accept an
     ## abbreviation and would silently drop an unknown name given alongside a
     ## known one. An NA needs no clause of its own: it matches no known name.
@@ -170,25 +181,43 @@ bql <- function(expression,
 }
 
 ## Convert one entry of 'results' into a data.frame using the declared
-## column types; the value column is named after the data item itself
+## column types; the value column is named after the data item itself.
+##
+## The columns are collected in order and named at the end rather than
+## assigned by name as they are found: assigning by name would replace an
+## earlier column of the same name instead of adding one, silently dropping
+## it, and would leave make.unique() below with nothing to do. It also lets
+## an item with no columns at all produce an empty data.frame, where
+## names(list()) would be NULL and make.unique() would reject it.
 .bqlItemToDataFrame <- function(item) {
-    cols <- list()
+    spec <- function(col, nm) list(list(col=col, nm=nm))
+    specs <- list()
     idcol <- item[["idColumn"]]
     if (!is.null(idcol))
-        cols[[.bqlColName(idcol, "ID")]] <- .bqlColumn(idcol)
+        specs <- c(specs, spec(idcol, .bqlColName(idcol, "ID")))
     valcol <- item[["valuesColumn"]]
-    if (!is.null(valcol)) {
-        nm <- if (is.null(item[["name"]]) || !nzchar(item[["name"]]))
-                  .bqlColName(valcol, "VALUE") else item[["name"]]
-        cols[[nm]] <- .bqlColumn(valcol)
-    }
+    if (!is.null(valcol))
+        specs <- c(specs, spec(valcol,
+                               if (is.null(item[["name"]]) || !nzchar(item[["name"]]))
+                                   .bqlColName(valcol, "VALUE") else item[["name"]]))
     for (sec in item[["secondaryColumns"]])
-        cols[[.bqlColName(sec, "V")]] <- .bqlColumn(sec)
-    names(cols) <- make.unique(names(cols))
+        specs <- c(specs, spec(sec, .bqlColName(sec, "V")))
+
+    cols <- lapply(specs, function(s) .bqlColumn(s[["col"]]))
+    names(cols) <- make.unique(vapply(specs, `[[`, character(1), "nm"))
+
+    ## a data.frame needs every column the same length; without this the
+    ## mismatch would be baked into a corrupt object instead of reported
+    rows <- unique(lengths(cols))
+    if (length(rows) > 1L)
+        stop("BQL item '", if (is.null(item[["name"]])) "" else item[["name"]],
+             "' has columns of unequal length: ",
+             paste0(names(cols), " (", lengths(cols), ")", collapse=", "),
+             call.=FALSE)
     ## avoid data.frame() name mangling and rownames
     structure(cols,
               class="data.frame",
-              row.names=if (length(cols)) seq_along(cols[[1L]]) else integer())
+              row.names=if (length(rows)) seq_len(rows) else integer())
 }
 
 .bqlColName <- function(col, fallback) {
@@ -204,11 +233,14 @@ bql <- function(expression,
 ## "NA" additionally map to NA for numeric columns only, as string columns
 ## may legitimately contain them (e.g. the ticker of 'NA US Equity').
 ##
-## A numeric column stays numeric throughout and so keeps the values exactly
-## as the service sent them, rather than losing the last digits to a detour
-## through character. Bloomberg sends float-derived prices such as
-## 230.66000366210938, which as.character() would truncate to
-## 230.66000366210901.
+## A numeric column of JSON numbers, with or without those placeholders, stays
+## numeric throughout and so keeps the values exactly as the service sent them,
+## rather than losing the last digits to a detour through character. Bloomberg
+## sends float-derived prices such as 230.66000366210938, which as.character()
+## would truncate to 230.66000366210901. A number written as a string is the
+## one case which still takes the detour: it has to be converted from
+## character anyway, and telling it apart from a number beforehand would need
+## a call per element for every column.
 ##
 ## One consequence of letting unlist() pick the type does remain: it coerces a
 ## logical before a string, so a JSON boolean sharing an array with a JSON
