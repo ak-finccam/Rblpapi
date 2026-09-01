@@ -25,10 +25,13 @@
 ##' item is self-describing: every column carries a declared type
 ##' (\sQuote{STRING}, \sQuote{DOUBLE}, \sQuote{INT}, \sQuote{DATE},
 ##' \sQuote{DATETIME}, \sQuote{BOOLEAN}) which is used to construct
-##' properly-typed \code{data.frame} columns. Parsing requires the
-##' \CRANpkg{jsonlite} package; set \code{parse=FALSE} to obtain the
-##' raw JSON string instead, e.g. for queries whose shape the
-##' parser does not handle.
+##' properly-typed \code{data.frame} columns. Parsing requires either
+##' the \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package;
+##' \CRANpkg{RcppSimdJson} is preferred when both are installed as it
+##' is faster on the large documents BQL can return. Both give the same
+##' result for the documents the service returns. Set
+##' \code{parse=FALSE} to obtain the raw JSON string instead, e.g. for
+##' queries whose shape the parser does not handle.
 ##'
 ##' Note that \sQuote{//blp/bqlsvc} is not part of the officially
 ##' documented public API; it is the service behind the Excel BQL
@@ -38,14 +41,19 @@
 ##' @param expression A character string with the BQL query, e.g.
 ##' \code{"get(px_last) for(['IBM US Equity'])"}.
 ##' @param parse A boolean indicating whether the JSON response should
-##' be parsed into \code{data.frame} objects (requires the
-##' \CRANpkg{jsonlite} package), defaults to \sQuote{TRUE}. If
-##' \sQuote{FALSE} the raw JSON string is returned.
+##' be parsed into \code{data.frame} objects (requires either the
+##' \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package),
+##' defaults to \sQuote{TRUE}. If \sQuote{FALSE} the raw JSON string
+##' is returned.
 ##' @param simplify A boolean indicating whether a query returning a
 ##' single data item should be returned directly as a \code{data.frame}
 ##' instead of a list of length one, defaults to \sQuote{TRUE}.
 ##' @param verbose A boolean indicating whether verbose operation is
 ##' desired, defaults to \sQuote{FALSE}.
+##' @param parser A character vector naming the JSON parsers to use in
+##' order of preference; the first one which is installed is used.
+##' \sQuote{NULL}, the default, takes the \code{bqlParser} option and,
+##' failing that, tries \sQuote{RcppSimdJson} then \sQuote{jsonlite}.
 ##' @param con A connection object as created by a \code{blpConnect}
 ##' call, and retrieved via the internal function
 ##' \code{defaultConnection}.
@@ -69,24 +77,81 @@ bql <- function(expression,
                 parse=TRUE,
                 simplify=TRUE,
                 verbose=FALSE,
+                parser=NULL,
                 con=defaultConnection()) {
 
+    ## resolve the parser before the request so that a missing package does
+    ## not discard a response which has already been retrieved
+    if (parse) parser <- .bqlParser(parser)
     res <- bql_Impl(con, expression, verbose)
-    if (!parse) return(.bqlJoin(res))
-    if (!requireNamespace("jsonlite", quietly=TRUE))
-        stop("The 'jsonlite' package is required to parse BQL responses; ",
-             "install it or call bql(..., parse=FALSE) for the raw JSON.",
+    ## the C++ layer returns nothing at all when the session ended before the
+    ## response arrived; say so rather than let the JSON parser report the
+    ## empty string as a truncated document
+    if (!length(res))
+        stop("The BQL request returned no messages, which happens when the ",
+             "session ends before the response arrives. Check the connection.",
              call.=FALSE)
-    .bqlParse(res, simplify=simplify)
+    if (!parse) return(.bqlJoin(res))
+    .bqlParse(res, simplify=simplify, parser=parser)
 }
 
 ## The service delivers responses larger than 4 MiB in several messages, cutting
 ## the JSON mid-token: the fragments form one document only once joined
 .bqlJoin <- function(fragments) paste0(fragments, collapse="")
 
+## Supported JSON parsers, in order of preference
+.bqlParsers <- c("RcppSimdJson", "jsonlite")
+
+## Select the first of 'want' which is installed. RcppSimdJson comes first by
+## default as it is faster on the large documents BQL can return, with jsonlite
+## as the fallback; naming one picks it, which also lets the tests exercise
+## both.
+.bqlParser <- function(want=NULL) {
+    ## NULL, the default of bql()'s 'parser', means "whatever the option says,
+    ## else the built-in order". Resolved here so that bql()'s signature, and
+    ## therefore its help page, does not name an unexported object.
+    if (is.null(want)) want <- getOption("bqlParser", .bqlParsers)
+    ## validated here rather than with match.arg(), which would accept an
+    ## abbreviation and would silently drop an unknown name given alongside a
+    ## known one. An NA needs no clause of its own: it matches no known name.
+    if (!is.character(want) || length(want) == 0L || !all(want %in% .bqlParsers))
+        stop("'parser' must be one or more of ",
+             paste0("'", .bqlParsers, "'", collapse=", "), call.=FALSE)
+    for (p in want) if (requireNamespace(p, quietly=TRUE)) return(p)
+    ## name only what was actually asked for, which may be a single parser
+    stop("Parsing BQL responses requires ",
+         paste0("'", want, "'", collapse=" or "),
+         "; install it or call bql(..., parse=FALSE) for the raw JSON.",
+         call.=FALSE)
+}
+
+## Parse one JSON document into nested lists. Both parsers are asked not to
+## simplify at all so that they return the very same structure: the typing is
+## done from the declared BQL column types in .bqlColumn. The two 'empty'
+## arguments make RcppSimdJson agree with jsonlite on '[]' and '{}', which it
+## maps to NULL by default.
+##
+## 'parser' is required rather than defaulted, so that bql() stays the one
+## place which decides which parser to use and .bqlParse only passes that
+## decision down.
+.bqlFromJSON <- function(txt, parser) {
+    switch(parser,
+           "RcppSimdJson" =
+               RcppSimdJson::fparse(txt,
+                                    max_simplify_lvl="list",
+                                    empty_array=list(),
+                                    empty_object=structure(list(),
+                                                           names=character())),
+           "jsonlite" =
+               jsonlite::fromJSON(txt, simplifyVector=FALSE),
+           ## without this a wrong name would return NULL, and the caller
+           ## would see an empty result rather than a diagnosis
+           stop("Unknown BQL JSON parser '", parser, "'", call.=FALSE))
+}
+
 ## Parse a raw BQL JSON response into a named list of data.frames
-.bqlParse <- function(json, simplify=TRUE) {
-    parsed <- jsonlite::fromJSON(.bqlJoin(json), simplifyVector=FALSE)
+.bqlParse <- function(json, simplify=TRUE, parser=.bqlParser()) {
+    parsed <- .bqlFromJSON(.bqlJoin(json), parser)
     .bqlCheckExceptions(parsed)
     tables <- list()
     for (item in parsed[["results"]]) {
@@ -120,25 +185,43 @@ bql <- function(expression,
 }
 
 ## Convert one entry of 'results' into a data.frame using the declared
-## column types; the value column is named after the data item itself
+## column types; the value column is named after the data item itself.
+##
+## The columns are collected in order and named at the end rather than
+## assigned by name as they are found: assigning by name would replace an
+## earlier column of the same name instead of adding one, silently dropping
+## it, and would leave make.unique() below with nothing to do. It also lets
+## an item with no columns at all produce an empty data.frame, where
+## names(list()) would be NULL and make.unique() would reject it.
 .bqlItemToDataFrame <- function(item) {
-    cols <- list()
+    spec <- function(col, nm) list(list(col=col, nm=nm))
+    specs <- list()
     idcol <- item[["idColumn"]]
     if (!is.null(idcol))
-        cols[[.bqlColName(idcol, "ID")]] <- .bqlColumn(idcol)
+        specs <- c(specs, spec(idcol, .bqlColName(idcol, "ID")))
     valcol <- item[["valuesColumn"]]
-    if (!is.null(valcol)) {
-        nm <- if (is.null(item[["name"]]) || !nzchar(item[["name"]]))
-                  .bqlColName(valcol, "VALUE") else item[["name"]]
-        cols[[nm]] <- .bqlColumn(valcol)
-    }
+    if (!is.null(valcol))
+        specs <- c(specs, spec(valcol,
+                               if (is.null(item[["name"]]) || !nzchar(item[["name"]]))
+                                   .bqlColName(valcol, "VALUE") else item[["name"]]))
     for (sec in item[["secondaryColumns"]])
-        cols[[.bqlColName(sec, "V")]] <- .bqlColumn(sec)
-    names(cols) <- make.unique(names(cols))
+        specs <- c(specs, spec(sec, .bqlColName(sec, "V")))
+
+    cols <- lapply(specs, function(s) .bqlColumn(s[["col"]]))
+    names(cols) <- make.unique(vapply(specs, `[[`, character(1), "nm"))
+
+    ## a data.frame needs every column the same length; without this the
+    ## mismatch would be baked into a corrupt object instead of reported
+    rows <- unique(lengths(cols))
+    if (length(rows) > 1L)
+        stop("BQL item '", if (is.null(item[["name"]])) "" else item[["name"]],
+             "' has columns of unequal length: ",
+             paste0(names(cols), " (", lengths(cols), ")", collapse=", "),
+             call.=FALSE)
     ## avoid data.frame() name mangling and rownames
     structure(cols,
               class="data.frame",
-              row.names=if (length(cols)) seq_along(cols[[1L]]) else integer())
+              row.names=if (length(rows)) seq_len(rows) else integer())
 }
 
 .bqlColName <- function(col, fallback) {
@@ -147,21 +230,75 @@ bql <- function(expression,
 }
 
 ## Convert a BQL column (list with 'type' and 'values') to a typed R vector.
+## The values arrive as a list of scalars, one element per row, and are
+## flattened with vectorised primitives rather than one element at a time.
+##
 ## JSON null maps to NA for every type; the string placeholders "NaN" and
 ## "NA" additionally map to NA for numeric columns only, as string columns
 ## may legitimately contain them (e.g. the ticker of 'NA US Equity').
+##
+## A numeric column of JSON numbers, with or without those placeholders, stays
+## numeric throughout and so keeps the values exactly as the service sent them,
+## rather than losing the last digits to a detour through character. Bloomberg
+## sends float-derived prices such as 230.66000366210938, which as.character()
+## would truncate to 230.66000366210901. A number written as a string is the
+## one case which still takes the detour: it has to be converted from
+## character anyway, and telling it apart from a number beforehand would need
+## a call per element for every column.
+##
+## One consequence of letting unlist() pick the type does remain: it coerces a
+## logical before a string, so a JSON boolean sharing an array with a JSON
+## number becomes 1 or 0 rather than "TRUE" or "FALSE". BQL declares one type
+## per column and does not mix the two, and avoiding this would need a call
+## per element for every column, which is the cost this function exists to
+## avoid.
 .bqlColumn <- function(col) {
-    values <- col[["values"]]
     type <- if (is.null(col[["type"]])) "STRING" else col[["type"]]
-    values <- vapply(values, function(v) {
-        if (is.null(v)) NA_character_ else as.character(v)
-    }, character(1))
-    numericNA <- function(v) { v[v %in% c("NaN", "NA", "")] <- NA_character_; v }
+    vals <- col[["values"]]
+    n <- length(vals)
+    vals[lengths(vals) == 0L] <- NA
+    values <- unlist(vals, use.names=FALSE)
+    ## unlist() flattens a nested value instead of failing, unlike the vapply()
+    ## this replaces. This catches a value which flattens to more than one
+    ## element; one which flattens to exactly one is kept, as it was before.
+    if (length(values) != n)
+        stop("BQL column '", .bqlColName(col, "?"),
+             "' has non-scalar values", call.=FALSE)
+    ## Blanking the placeholders in the list and flattening again is what keeps
+    ## a numeric column numeric, and so exact. Only a numeric column is treated
+    ## this way, as a string column may legitimately hold those spellings, and
+    ## any other string is a number written as a string which as.numeric()
+    ## still converts. 'values' is already the character form here, so finding
+    ## them takes one vectorised pass; a JSON number never prints as one, and a
+    ## blanked null is NA_character_ rather than "NA", so neither is mistaken
+    ## for a placeholder.
+    if (is.character(values) && (type == "DOUBLE" || type == "INT")) {
+        isph <- values %in% c("NaN", "NA", "")
+        if (any(isph)) {
+            vals[isph] <- NA
+            values <- unlist(vals, use.names=FALSE)
+        }
+    }
     switch(type,
-           "DOUBLE"   = as.numeric(numericNA(values)),
-           "INT"      = as.integer(numericNA(values)),
-           "BOOLEAN"  = as.logical(toupper(values)),
-           "DATE"     = as.Date(substr(values, 1L, 10L)),
-           "DATETIME" = as.POSIXct(values, format="%Y-%m-%dT%H:%M:%OS", tz="UTC"),
-           values)
+           "DOUBLE"   = as.numeric(values),
+           "INT"      = as.integer(values),
+           "BOOLEAN"  = if (is.logical(values)) values
+                        else as.logical(toupper(values)),
+           ## truncating inside .bqlByUnique truncates the distinct strings
+           ## rather than every row
+           "DATE"     = .bqlByUnique(as.character(values),
+                                     function(u) as.Date(substr(u, 1L, 10L))),
+           "DATETIME" = .bqlByUnique(as.character(values), as.POSIXct,
+                                     format="%Y-%m-%dT%H:%M:%OS", tz="UTC"),
+           ## a column of only nulls has flattened to a logical vector, so the
+           ## character types still need the conversion
+           as.character(values))
+}
+
+## Parsing a date string costs far more per value than a hash lookup, and BQL
+## date columns repeat heavily (one date per period, the same date for many
+## securities), so convert only the distinct strings
+.bqlByUnique <- function(v, fun, ...) {
+    u <- unique(v)
+    fun(u, ...)[match(v, u)]
 }

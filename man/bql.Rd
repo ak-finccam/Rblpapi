@@ -5,16 +5,17 @@
 \title{Run 'Bloomberg Query Language' (BQL) Queries}
 \usage{
 bql(expression, parse = TRUE, simplify = TRUE, verbose = FALSE,
-  con = defaultConnection())
+  parser = NULL, con = defaultConnection())
 }
 \arguments{
 \item{expression}{A character string with the BQL query, e.g.
 \code{"get(px_last) for(['IBM US Equity'])"}.}
 
 \item{parse}{A boolean indicating whether the JSON response should
-be parsed into \code{data.frame} objects (requires the
-\CRANpkg{jsonlite} package), defaults to \sQuote{TRUE}. If
-\sQuote{FALSE} the raw JSON string is returned.}
+be parsed into \code{data.frame} objects (requires either the
+\CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package),
+defaults to \sQuote{TRUE}. If \sQuote{FALSE} the raw JSON string
+is returned.}
 
 \item{simplify}{A boolean indicating whether a query returning a
 single data item should be returned directly as a \code{data.frame}
@@ -22,6 +23,11 @@ instead of a list of length one, defaults to \sQuote{TRUE}.}
 
 \item{verbose}{A boolean indicating whether verbose operation is
 desired, defaults to \sQuote{FALSE}.}
+
+\item{parser}{A character vector naming the JSON parsers to use in
+order of preference; the first one which is installed is used.
+\sQuote{NULL}, the default, takes the \code{bqlParser} option and,
+failing that, tries \sQuote{RcppSimdJson} then \sQuote{jsonlite}.}
 
 \item{con}{A connection object as created by a \code{blpConnect}
 call, and retrieved via the internal function
@@ -48,10 +54,13 @@ The service returns a single JSON document. Each queried data
 item is self-describing: every column carries a declared type
 (\sQuote{STRING}, \sQuote{DOUBLE}, \sQuote{INT}, \sQuote{DATE},
 \sQuote{DATETIME}, \sQuote{BOOLEAN}) which is used to construct
-properly-typed \code{data.frame} columns. Parsing requires the
-\CRANpkg{jsonlite} package; set \code{parse=FALSE} to obtain the
-raw JSON string instead, e.g. for queries whose shape the
-parser does not handle.
+properly-typed \code{data.frame} columns. Parsing requires either
+the \CRANpkg{RcppSimdJson} or the \CRANpkg{jsonlite} package;
+\CRANpkg{RcppSimdJson} is preferred when both are installed as it
+is faster on the large documents BQL can return. Both give the same
+result for the documents the service returns. Set
+\code{parse=FALSE} to obtain the raw JSON string instead, e.g. for
+queries whose shape the parser does not handle.
 
 Note that \sQuote{//blp/bqlsvc} is not part of the officially
 documented public API; it is the service behind the Excel BQL
