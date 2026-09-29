@@ -1,5 +1,7 @@
 # Builds source tarball, Linux binary (Ubuntu Noble), and Windows binary, then
 # publishes all three to ak-finccam/r-packages as a drat-style CRAN repository.
+# drat publishes the source tarball and the Windows binary. The Linux binary
+# goes to bin/linux/noble/4.5/src/contrib, where renv looks for it.
 #
 # Prerequisites:
 #   - Public GitHub repo ak-finccam/r-packages with GitHub Pages enabled
@@ -37,6 +39,8 @@ jobs:
           path: "*.tar.gz"
 
   build-linux-binary:
+    # The publish job puts this binary in bin/linux/noble/4.5. If you change the
+    # runner or the R minor version, the binary needs its own folder.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -57,9 +61,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux-binary
-          path: "*.tar.gz"
           # R CMD INSTALL --build on Linux produces a binary .tar.gz
           # (distinct from the source tarball — it contains compiled .so files)
+          path: "*_R_x86_64-pc-linux-gnu.tar.gz"
+          if-no-files-found: error
 
   build-windows-binary:
     runs-on: windows-latest
@@ -107,11 +112,37 @@ jobs:
         run: install.packages("drat")
         shell: Rscript {0}
 
-      - name: Publish with drat
+      - name: Publish source tarball and Windows binary with drat
         run: |
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) | while read f; do
+          for f in artifacts/source/*.tar.gz artifacts/windows-binary/*.zip; do
             Rscript -e "drat::insertPackage('$f', repodir='r-packages', commit=FALSE)"
           done
+        shell: bash
+
+      # drat would treat the Linux binary as a source package and put it in
+      # src/contrib, where renv never looks. renv reads Linux binaries from
+      # bin/linux/<distribution>/<R minor version>/src/contrib, named like
+      # source packages.
+      - name: Publish Linux binary
+        run: |
+          shopt -s nullglob
+          binaries=(artifacts/linux-binary/*_R_x86_64-pc-linux-gnu.tar.gz)
+          if [ "${#binaries[@]}" -ne 1 ]; then
+            echo "::error::Expected one Linux binary, found ${#binaries[@]}"
+            exit 1
+          fi
+          binary="${binaries[0]}"
+
+          description=$(tar -xzOf "$binary" Rblpapi/DESCRIPTION)
+          if ! grep -q '^Built: ' <<< "$description"; then
+            echo "::error::$binary has no Built field in its DESCRIPTION"
+            exit 1
+          fi
+
+          contrib=r-packages/bin/linux/noble/4.5/src/contrib
+          mkdir -p "$contrib"
+          cp "$binary" "$contrib/$(basename "$binary" _R_x86_64-pc-linux-gnu.tar.gz).tar.gz"
+          Rscript -e 'tools::write_PACKAGES("'"$contrib"'", type = "source", latestOnly = FALSE, addFiles = TRUE, fields = "Built")'
         shell: bash
 
       - name: Commit and push
