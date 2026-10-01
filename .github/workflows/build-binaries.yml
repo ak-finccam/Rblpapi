@@ -3,6 +3,10 @@
 # drat publishes the source tarball and the Windows binary. The Linux binary
 # goes to bin/linux/noble/4.5/src/contrib, where renv looks for it.
 #
+# The workflow publishes each version only once. The nix setup of finccam-engine
+# stores the hash of the source tarball, so a rebuilt tarball breaks it. To
+# publish a change, raise the version in DESCRIPTION.
+#
 # Prerequisites:
 #   - Public GitHub repo ak-finccam/r-packages with GitHub Pages enabled
 #     (Settings → Pages → Source: Deploy from a branch → main, /).
@@ -16,8 +20,35 @@ on:
     branches: [feature/bql-finccam]
   workflow_dispatch:
 
+# A second run waits for the first, so that it sees the version the first run
+# published.
+concurrency: publish
+
 jobs:
+  check-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      published: ${{ steps.check.outputs.published }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The clone holds only the file tree, so it downloads no tarball.
+      - name: Check if this version is already published
+        id: check
+        run: |
+          version=$(sed -n 's/^Version: //p' DESCRIPTION)
+          git clone --quiet --depth 1 --filter=blob:none --no-checkout \
+            https://github.com/ak-finccam/r-packages.git r-packages
+          if [ -n "$(git -C r-packages ls-tree --name-only HEAD "src/contrib/Rblpapi_$version.tar.gz")" ]; then
+            echo "::warning::Rblpapi $version is already published. Raise the version in DESCRIPTION to publish this commit."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-source:
+    needs: check-version
+    if: needs.check-version.outputs.published == 'false'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +72,8 @@ jobs:
   build-linux-binary:
     # The publish job puts this binary in bin/linux/noble/4.5. If you change the
     # runner or the R minor version, the binary needs its own folder.
+    needs: check-version
+    if: needs.check-version.outputs.published == 'false'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +100,8 @@ jobs:
           if-no-files-found: error
 
   build-windows-binary:
+    needs: check-version
+    if: needs.check-version.outputs.published == 'false'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
