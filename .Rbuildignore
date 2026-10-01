@@ -12,3 +12,5 @@ src/Makevars.win$
 ^\.github
 ^\.editorconfig
 fullCleanup.sh
+^AGENTS\.md$
+^CLAUDE\.md$
